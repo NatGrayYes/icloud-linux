@@ -23,6 +23,7 @@ import fuse
 import yaml
 from fuse import Fuse
 from pyicloud import PyiCloudService
+from requests.adapters import HTTPAdapter
 from pyicloud.exceptions import (
     PyiCloud2FARequiredException,
     PyiCloud2SARequiredException,
@@ -42,6 +43,20 @@ fuse.fuse_python_api = (0, 2)
 ROOT_DRIVEWSID = "FOLDER::com.apple.CloudDocs::root"
 DIRECTORY_NODE_TYPES = {"folder", "app_library"}
 IO_CHUNK_SIZE = 1024 * 1024
+HTTP_TIMEOUT = (10, 40)  # (connect, read) seconds
+
+
+class TimeoutAdapter(HTTPAdapter):
+    """Timeout to make dead sockets raise an exception."""
+
+    def __init__(self, *args, timeout=HTTP_TIMEOUT, **kwargs):
+        self._default_timeout = timeout
+        super().__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = self._default_timeout
+        return super().send(request, **kwargs)
 
 
 def normalize_icloud_path(path):
@@ -791,7 +806,11 @@ class ICloudSyncEngine:
                 self._schedule_all_unhydrated()
         else:
             self.logger.info("Persistent cache not initialized yet; performing first remote crawl")
-            self.initial_scan()
+            try:
+                self.initial_scan()
+            except Exception as exc:
+                # Raising here would crash-loop under systemd and re-auth against Apple each time.
+                self.logger.error("Initial remote crawl failed: %s; will retry on the next refresh", exc)
             if self.warmup_mode == "background":
                 self._schedule_all_unhydrated()
         if self.auto_sync:
@@ -1019,52 +1038,59 @@ class ICloudSyncEngine:
         _crawl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="icloud-crawl")
         FOLDER_TIMEOUT = 60  # seconds per folder before giving up
 
-        while queue:
-            node, path = queue.popleft()
-            scanned_folders += 1
-            try:
-                future = _crawl_executor.submit(node.get_children, True)
-                children = future.result(timeout=FOLDER_TIMEOUT)
-            except TimeoutError:
-                self.logger.warning(
-                    "Timed out enumerating %s after %ss — skipping folder", path, FOLDER_TIMEOUT
-                )
-                continue
-            except Exception as exc:
-                self.logger.error("Failed to enumerate %s: %s", path, exc)
-                continue
+        try:
+            while queue:
+                node, path = queue.popleft()
+                scanned_folders += 1
+                try:
+                    future = _crawl_executor.submit(node.get_children, True)
+                    children = future.result(timeout=FOLDER_TIMEOUT)
+                except TimeoutError:
+                    self.logger.warning(
+                        "Timed out enumerating %s after %ss", path, FOLDER_TIMEOUT
+                    )
+                    raise RuntimeError(
+                        f"Remote crawl incomplete: timed out enumerating {path}"
+                    ) from None
+                except Exception as exc:
+                    self.logger.error("Failed to enumerate %s: %s", path, exc)
+                    raise RuntimeError(
+                        f"Remote crawl incomplete: failed to enumerate {path}: {exc}"
+                    ) from exc
 
-            for child in children:
-                child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
-                meta = self._node_to_meta(child, child_path)
-                snapshot[meta["remote_drivewsid"]] = meta
-                if self._is_directory_type(meta["type"]):
-                    # If sync_paths is set, only recurse into directories that are
-                    # on the path to or inside a sync_path. This avoids crawling
-                    # the entire iCloud Drive when only /Downloads is needed.
-                    if self.sync_paths is not None:
-                        should_recurse = False
-                        for sp in self.sync_paths:
-                            sp = sp.rstrip("/")
-                            cp = child_path.rstrip("/")
-                            # Recurse if child is a prefix of sync_path (ancestor)
-                            # or if child is inside sync_path (descendant)
-                            if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
-                                should_recurse = True
-                                break
-                        if not should_recurse:
-                            continue
-                    queue.append((child, child_path))
+                for child in children:
+                    child_path = "/" + child.name if path == "/" else path.rstrip("/") + "/" + child.name
+                    meta = self._node_to_meta(child, child_path)
+                    snapshot[meta["remote_drivewsid"]] = meta
+                    if self._is_directory_type(meta["type"]):
+                        # If sync_paths is set, only recurse into directories that are
+                        # on the path to or inside a sync_path. This avoids crawling
+                        # the entire iCloud Drive when only /Downloads is needed.
+                        if self.sync_paths is not None:
+                            should_recurse = False
+                            for sp in self.sync_paths:
+                                sp = sp.rstrip("/")
+                                cp = child_path.rstrip("/")
+                                # Recurse if child is a prefix of sync_path (ancestor)
+                                # or if child is inside sync_path (descendant)
+                                if sp.startswith(cp + "/") or sp == cp or cp.startswith(sp + "/"):
+                                    should_recurse = True
+                                    break
+                            if not should_recurse:
+                                continue
+                        queue.append((child, child_path))
 
-            now = time.time()
-            if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
-                self.logger.info(
-                    "Remote metadata crawl progress: %s folders scanned, %s entries discovered, %s folders queued",
-                    scanned_folders,
-                    len(snapshot),
-                    len(queue),
-                )
-                last_progress_log = now
+                now = time.time()
+                if scanned_folders == 1 or scanned_folders % 25 == 0 or now - last_progress_log >= 5:
+                    self.logger.info(
+                        "Remote metadata crawl progress: %s folders scanned, %s entries discovered, %s folders queued",
+                        scanned_folders,
+                        len(snapshot),
+                        len(queue),
+                    )
+                    last_progress_log = now
+        finally:
+            _crawl_executor.shutdown(wait=False)
 
         self.logger.info(
             "Remote metadata crawl complete: %s entries across %s folders in %.1fs",
@@ -1702,6 +1728,9 @@ class ICloudFS(Fuse):
             self.api = PyiCloudService(username, password,
                                        cookie_directory=cookie_dir,
                                        authenticate=False)
+            _adapter = TimeoutAdapter()
+            self.api.session.mount("https://", _adapter)
+            self.api.session.mount("http://", _adapter)
             if _partition:
                 self.api._setup_endpoint = (
                     f"https://p{_partition}-setup.icloud.com/setup/ws/1"
