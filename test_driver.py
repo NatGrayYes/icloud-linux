@@ -9,7 +9,7 @@ import stat
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from driver import ICloudFS, ICloudSyncEngine, LocalMirror, SyncState
 from pyicloud.exceptions import PyiCloudAPIResponseException, PyiCloudFailedLoginException
@@ -383,6 +383,38 @@ class RemoteSnapshotRaceTests(unittest.TestCase):
 
         self.assertIsNone(self.state.get_entry("/old.txt"))
         self.assertFalse(self.mirror.exists("/old.txt"))
+
+    def _assert_crawl_stops_after_first_failure(self, failure):
+        first_folder = Mock()
+        first_folder.name = "first"
+        first_folder.data = {"type": "FOLDER", "drivewsid": "folder-first"}
+        later_folder = Mock()
+        later_folder.name = "later"
+        later_folder.data = {"type": "FOLDER", "drivewsid": "folder-later"}
+        root = Mock()
+        self.engine.api.drive.root = root
+
+        root_future = Mock()
+        root_future.result.return_value = [first_folder, later_folder]
+        failed_future = Mock()
+        failed_future.result.side_effect = failure
+        executor = Mock()
+        executor.submit.side_effect = [root_future, failed_future]
+        self.engine._apply_remote_snapshot = Mock()
+
+        with patch("driver.ThreadPoolExecutor", return_value=executor):
+            with self.assertRaisesRegex(RuntimeError, "Remote crawl incomplete"):
+                self.engine.initial_scan()
+
+        self.assertEqual(executor.submit.call_count, 2)
+        self.engine._apply_remote_snapshot.assert_not_called()
+        executor.shutdown.assert_called_once_with(wait=False)
+
+    def test_crawl_aborts_after_first_enumeration_error(self):
+        self._assert_crawl_stops_after_first_failure(RuntimeError("iCloud request failed"))
+
+    def test_crawl_aborts_after_first_folder_timeout(self):
+        self._assert_crawl_stops_after_first_failure(TimeoutError())
 
 
 class PermissionCallbackTests(unittest.TestCase):
